@@ -15,3 +15,9 @@ venv/
 
 # Environmnet variables
 .env
+
+# large local files
+*.html
+*.tmp
+*.log
+data/*_raw.json

@@ -14,26 +14,25 @@ from langchain.schema import BaseRetriever
 from sentence_transformers import CrossEncoder
 from langchain.prompts import PromptTemplate
 
-
 import numpy as np
-
-
 
 
 load_dotenv()
 
+#Load specific documents from data folder
+source_files = [
+    "data/uga_resources_all.json",
+    "data/uga_osfa_faqs.json",
+    "data/cfpb_docs.json",
+]
 all_docs = []
-# Load docs from data folder
-for filename in os.listdir("data/"):
-    if filename.endswith(".json"):
-        filepath = os.path.join("data/", filename)
-        with open(filepath) as f:
-            docs = json.load(f)
-            all_docs.extend(docs)
+for filepath in source_files:
+    with open(filepath) as f:
+        all_docs.extend(json.load(f))
 
 # Chunk docs
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=600,      
+    chunk_size=500,      
     chunk_overlap=50,    
     separators=["\n\n", "\n", ". ", " ", ""]  
 )
@@ -52,13 +51,15 @@ for doc in all_docs:
     chunks = text_splitter.split_text(text)
     # Add source label
     for chunk in chunks:
+        if len(chunk) < 80:
+            continue
         source_url = doc.get("url", "unknown")
         if "uga.edu" in source_url.lower():
             label = "UGA FAQ"
         elif any(x in source_url.lower() for x in ["consumerfinance.gov", "studentaid.gov", "ed.gov"]):
             label = "CFPB/DOE"
         else:
-            label = "General Source"
+            label = "Other Source"
 
         documents.append(Document(
             page_content=f"[{label}] {chunk}",
@@ -70,10 +71,15 @@ for doc in all_docs:
 embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
 
 # Build FAISS vectorstore
-vectorstore = FAISS.from_documents(documents, embeddings)
+INDEX_DIR = "indexes/faiss_index"
+if os.path.isdir(INDEX_DIR):
+    vectorstore = FAISS.load_local(INDEX_DIR, embeddings, allow_dangerous_deserialization=True)
+else:
+    vectorstore = FAISS.from_documents(documents, embeddings)
+    vectorstore.save_local(INDEX_DIR)
 
 # Retriever with reranking algorithm
-base_retriever = vectorstore.as_retriever(search_kwargs={"k": 25})
+base_retriever = vectorstore.as_retriever(search_kwargs={"k": 12})
 cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 def rerank_retrieve(query):
@@ -82,7 +88,7 @@ def rerank_retrieve(query):
     scores = cross_encoder.predict(pairs)
     for d, s in zip(base_docs, scores):
         d.metadata["rerank_score"] = float(s)
-    return sorted(base_docs, key=lambda d: d.metadata["rerank_score"], reverse=True)[:5]
+    return sorted(base_docs, key=lambda d: d.metadata["rerank_score"], reverse=True)[:4]
 
 # Custom reranker with proper typing and methods
 class RerankRetriever(BaseRetriever):
@@ -116,9 +122,8 @@ qa_chain = RetrievalQA.from_chain_type(
 
 )
 
-
 if __name__ == "__main__":
-    question = "How do I pay off my loans if I don't have the money right now?"
+    question = "How do I pay off my student loans I dont have the money right now"
     result = qa_chain.invoke({"query": question})
     
     print("\nQUESTION:", question)
@@ -126,4 +131,4 @@ if __name__ == "__main__":
     print("\n--- Retrieved Chunks ---")
     for i, d in enumerate(result["source_documents"]):
         print(f"[{i}] Source: {d.metadata['source']}")
-        print(d.page_content[:500], "\n")  # preview first 500 chars
+        print(d.page_content[:500], "\n")
