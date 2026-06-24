@@ -1,36 +1,33 @@
 import streamlit as st
-from rag import qa_chain
+from rag import ask
 
-st.title("Student Loan Q&A Assistant")
+st.title("UGA Student Loans Assistant")
+st.write("Ask me anything about student loans, FAFSA, or financial aid!")
 
-# Initialize session state for chat history if it doesn't exist
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-# Input box for user question
-question = st.text_input("Ask a question about student loans:")
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
 
-if question:
-    result = qa_chain.invoke({"query": question})
-    answer = result["result"]
-    sources = result["source_documents"]
-    
-    # Display answer
-    st.write("### Answer:")
-    st.write(answer)
-    
-    # Display sources
-    st.write("### Sources:")
-    for i, doc in enumerate(sources):
-        with st.expander(f"Source {i+1}: {doc.metadata['source']}"):
-            st.write(doc.page_content)
-    
-    # Add to chat history
-    st.session_state.chat_history.append({"question": question, "answer": answer})
+if prompt := st.chat_input("Ask your question..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.write(prompt)
 
-# Display chat history
-if st.session_state.chat_history:
-    st.write("### Chat History:")
-    for chat in reversed(st.session_state.chat_history):
-        with st.expander(f"Q: {chat['question']}", expanded=False):
-            st.write(chat["answer"])
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            try:
+                result = ask(prompt)
+                answer = result["result"]
+                sources = result["source_documents"]
+                st.write(answer)
+                with st.expander("Sources"):
+                    for doc in sources:
+                        st.write(f"- {doc.metadata.get('source', 'unknown')}")
+            except Exception as e:
+                answer = f"Sorry, I ran into an error answering that: {e}"
+                st.error(answer)
+
+    st.session_state.messages.append({"role": "assistant", "content": answer})

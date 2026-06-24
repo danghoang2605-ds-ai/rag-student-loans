@@ -2,24 +2,20 @@ import os
 from dotenv import load_dotenv
 from config import CUSTOM_PROMPT_TEMPLATE
 import json
-from langchain_openai import OpenAIEmbeddings
+
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_anthropic import ChatAnthropic
 from langchain_community.vectorstores import FAISS
-from langchain.docstore.document import Document
-from langchain.chains import RetrievalQA
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
-from langchain.schema import BaseRetriever
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import PromptTemplate
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 from sentence_transformers import CrossEncoder
-from langchain.prompts import PromptTemplate
 
-import numpy as np
+# load_dotenv(override=False)
 
-
-load_dotenv()
-
-#Load specific documents from data folder
 source_files = [
     "data/uga_resources_all.json",
     "data/uga_osfa_faqs.json",
@@ -27,29 +23,22 @@ source_files = [
 ]
 all_docs = []
 for filepath in source_files:
-    with open(filepath) as f:
+    with open(filepath, encoding="utf-8") as f:
         all_docs.extend(json.load(f))
 
-# Chunk docs
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,      
-    chunk_overlap=50,    
-    separators=["\n\n", "\n", ". ", " ", ""]  
+    chunk_size=500,
+    chunk_overlap=50,
+    separators=["\n\n", "\n", ". ", " ", ""]
 )
 
-#Turn docs into langchain documents
 documents = []
 for doc in all_docs:
     q = doc.get("question", "")
     a = doc.get("answer", "")
-
-    if q:
-        text = f"Question: {q}\nAnswer: {a}"
-    else:   
-        text = a
+    text = f"Question: {q}\nAnswer: {a}" if q else a
 
     chunks = text_splitter.split_text(text)
-    # Add source label
     for chunk in chunks:
         if len(chunk) < 80:
             continue
@@ -66,66 +55,73 @@ for doc in all_docs:
             metadata={"source": source_url, "source_type": label}
         ))
 
-        
-# Embeddings
-embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-# Build FAISS vectorstore
-INDEX_DIR = "indexes/faiss_index"
+INDEX_DIR = "indexes/faiss_index_local"
+
 if os.path.isdir(INDEX_DIR):
     vectorstore = FAISS.load_local(INDEX_DIR, embeddings, allow_dangerous_deserialization=True)
 else:
+    print(f"No local index found at {INDEX_DIR}, building a new one from {len(documents)} chunks...")
     vectorstore = FAISS.from_documents(documents, embeddings)
     vectorstore.save_local(INDEX_DIR)
+    print(f"Saved new FAISS index to {INDEX_DIR}")
 
-# Retriever with reranking algorithm
-base_retriever = vectorstore.as_retriever(search_kwargs={"k": 12})
 cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
+
 def rerank_retrieve(query):
-    base_docs = base_retriever.vectorstore.similarity_search(query, k=25)
+    base_docs = vectorstore.similarity_search(query, k=25)
     pairs = [(query, d.page_content) for d in base_docs]
     scores = cross_encoder.predict(pairs)
     for d, s in zip(base_docs, scores):
         d.metadata["rerank_score"] = float(s)
     return sorted(base_docs, key=lambda d: d.metadata["rerank_score"], reverse=True)[:4]
 
-# Custom reranker with proper typing and methods
-class RerankRetriever(BaseRetriever):
-    def __init__(self):
-        super().__init__()
 
-    def _get_relevant_documents(self, query):
+class RerankRetriever(BaseRetriever):
+    def _get_relevant_documents(self, query, *, run_manager=None):
         return rerank_retrieve(query)
-    
+
+
 retriever = RerankRetriever()
 
-# Claude 3 haiku LLM
-llm = ChatAnthropic(model="claude-3-haiku-20240307", temperature=0.3, max_tokens=400)
-
+llm = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0.3, max_tokens=400)
 
 CUSTOM_PROMPT = PromptTemplate(
     template=CUSTOM_PROMPT_TEMPLATE,
     input_variables=["context", "question"]
 )
 
-# Chain to inject relevant documents into LLM prompt
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    retriever=retriever,
-    chain_type="stuff",   
-    return_source_documents=True,
-    chain_type_kwargs={
-        "prompt": CUSTOM_PROMPT,
-        "document_separator": "\n\n"
-    },
 
+def format_docs(docs):
+    return "\n\n".join(d.page_content for d in docs)
+
+
+# LCEL chain — replaces the deleted RetrievalQA.from_chain_type
+rag_chain = (
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    | CUSTOM_PROMPT
+    | llm
+    | StrOutputParser()
 )
+
+
+def ask(question: str):
+    docs = retriever.invoke(question)
+    answer = rag_chain.invoke(question)
+    return {"result": answer, "source_documents": docs}
+
 
 if __name__ == "__main__":
     question = "How do I pay off my student loans I dont have the money right now"
-    result = qa_chain.invoke({"query": question})
-    
+
+    try:
+        result = ask(question)
+    except Exception as e:
+        print(f"\n[ERROR] Something went wrong while answering the question: {e}")
+        raise
+
     print("\nQUESTION:", question)
     print("\nANSWER:", result["result"])
     print("\n--- Retrieved Chunks ---")
